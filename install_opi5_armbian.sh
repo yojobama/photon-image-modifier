@@ -33,6 +33,35 @@ cat /etc/systemd/system/photonvision.service
 # sed -i s/verbosity=1/verbosity=7/g /boot/armbianEnv.txt
 sed -i 's/extraargs=/&initcall_debug ignore_loglevel cryptomgr.notests=1 nokprobes initcall_blacklist=init_kprobe_trace,crypto_kdf108_init,init_blk_tracer trace_buf_size=1 /' /boot/armbianEnv.txt
 
+# Enable Vulkan-capable GPU acceleration on the Mali-G610 (RK3588/RK3588S).
+#
+# The vendor kernel's kbase interface doesn't expose the GPU to Mesa at all
+# until the panthor-gpu device-tree overlay is active - without it, Vulkan
+# enumerates nothing but the llvmpipe software rasterizer (see Armbian
+# configng PR #886, "enable panthor-gpu DT overlay on rk3588 vendor-kernel
+# desktops": https://github.com/armbian/configng/pull/886). Armbian only
+# auto-enables that overlay when a desktop environment is installed via
+# armbian-config, which this minimal/headless image build never does - so
+# without this, every PhotonVision Orange Pi 5 image ships with a Mali GPU
+# that Vulkan can never see, regardless of what's installed in userspace.
+#
+# mesa-vulkan-drivers on Debian trixie (25.0.7-2, arm64) already includes
+# PanVK/Panfrost Vulkan support for Mali-G610 - no third-party PPA needed on
+# this base, unlike Ubuntu.
+apt-get --yes -qq install mesa-vulkan-drivers libvulkan1
+
+# Idempotent append: add the token to an existing overlays= line if one is
+# present (whether or not it already lists other overlays), otherwise add a
+# fresh line. Skips entirely if panthor-gpu is already listed, so re-running
+# this script against an already-patched image is a no-op.
+if grep -q '\bpanthor-gpu\b' /boot/armbianEnv.txt; then
+    echo "panthor-gpu overlay already present in /boot/armbianEnv.txt"
+elif grep -q '^overlays=' /boot/armbianEnv.txt; then
+    sed -i '/^overlays=/ s/$/ panthor-gpu/' /boot/armbianEnv.txt
+else
+    echo 'overlays=panthor-gpu' >> /boot/armbianEnv.txt
+fi
+
 # networkd isn't being used, this causes an unnecessary delay
 # systemctl disable systemd-networkd-wait-online.service
 
