@@ -33,34 +33,58 @@ cat /etc/systemd/system/photonvision.service
 # sed -i s/verbosity=1/verbosity=7/g /boot/armbianEnv.txt
 sed -i 's/extraargs=/&initcall_debug ignore_loglevel cryptomgr.notests=1 nokprobes initcall_blacklist=init_kprobe_trace,crypto_kdf108_init,init_blk_tracer trace_buf_size=1 /' /boot/armbianEnv.txt
 
-# Enable Vulkan-capable GPU acceleration on the Mali-G610 (RK3588/RK3588S).
+# Vulkan on the Mali-G610 (RK3588/RK3588S), for PhotonVision's vkapriltag
+# detector.
 #
-# The vendor kernel's kbase interface doesn't expose the GPU to Mesa at all
-# until the panthor-gpu device-tree overlay is active - without it, Vulkan
-# enumerates nothing but the llvmpipe software rasterizer (see Armbian
-# configng PR #886, "enable panthor-gpu DT overlay on rk3588 vendor-kernel
-# desktops": https://github.com/armbian/configng/pull/886). Armbian only
-# auto-enables that overlay when a desktop environment is installed via
-# armbian-config, which this minimal/headless image build never does - so
-# without this, every PhotonVision Orange Pi 5 image ships with a Mali GPU
-# that Vulkan can never see, regardless of what's installed in userspace.
+# There are two Vulkan stacks available on this SoC and they are NOT
+# interchangeable. Measured on an Orange Pi 5 Plus, same binary, same
+# 1280x800 tag36h11 image, decimation 1:
 #
-# mesa-vulkan-drivers on Debian trixie (25.0.7-2, arm64) already includes
-# PanVK/Panfrost Vulkan support for Mali-G610 - no third-party PPA needed on
-# this base, unlike Ubuntu.
-apt-get --yes -qq install mesa-vulkan-drivers libvulkan1
+#   Mesa PanVK on the upstream panthor kernel driver ... 141 ms/frame
+#   ARM libmali on the vendor kbase driver ............   11 ms/frame
+#   CPU libapriltag detector (for reference) ..........   43 ms/frame
+#
+# PanVK is not merely slower, it is slower than not using the GPU at all, so
+# an image built on it makes vkapriltag pointless. The gap is driver-side,
+# not algorithmic: the worst single compute shader runs 78x slower under
+# PanVK (91.8 ms vs 1.18 ms) and the adaptive-threshold pass 11.5x slower.
+# PanVK additionally reports no host-cached memory types and no timestamp
+# queries. With libmali, vkapriltag is ~4x faster than the CPU detector.
+#
+# Consequently this deliberately does NOT enable the panthor-gpu device-tree
+# overlay. panthor and the vendor kbase driver are mutually exclusive, and
+# binding the GPU to panthor is exactly what makes libmali unusable (no
+# /dev/mali0). kbase needs no overlay here - it is already builtin in the
+# Armbian vendor kernel (CONFIG_MALI_MIDGARD=y).
+#
+# g24p0, not g13p0: only the g24p0 blob ships a Vulkan ICD
+# (libMaliVulkan.so.1 plus /usr/share/vulkan/icd.d/mali.json). g13p0 is
+# GLES/EGL/OpenCL only and silently leaves Vulkan with no driver at all.
+#
+# libvulkan1 is still required - it is the Vulkan *loader*, which is separate
+# from the ICD libmali provides. mesa-vulkan-drivers is deliberately not
+# installed: its panfrost and lavapipe ICDs would enumerate alongside
+# libmali's and can be selected instead of it.
+# curl is not in the Armbian minimal base image, and this script runs before
+# install_common.sh, so it cannot be assumed present.
+apt-get --yes -qq install libvulkan1 curl
 
-# Idempotent append: add the token to an existing overlays= line if one is
-# present (whether or not it already lists other overlays), otherwise add a
-# fresh line. Skips entirely if panthor-gpu is already listed, so re-running
-# this script against an already-patched image is a no-op.
-if grep -q '\bpanthor-gpu\b' /boot/armbianEnv.txt; then
-    echo "panthor-gpu overlay already present in /boot/armbianEnv.txt"
-elif grep -q '^overlays=' /boot/armbianEnv.txt; then
-    sed -i '/^overlays=/ s/$/ panthor-gpu/' /boot/armbianEnv.txt
-else
-    echo 'overlays=panthor-gpu' >> /boot/armbianEnv.txt
-fi
+LIBMALI_DEB="libmali-valhall-g610-g24p0-gbm_1.9-1_arm64.deb"
+LIBMALI_URL="https://github.com/tsukumijima/libmali-rockchip/releases/download/v1.9-1-20260312-bd33ee2/${LIBMALI_DEB}"
+curl -fsSL -o "/tmp/${LIBMALI_DEB}" "${LIBMALI_URL}"
+# via apt, not dpkg -i, so dependencies resolve; the package also drops
+# /etc/ld.so.conf.d/00-aarch64-mali.conf, which is what puts
+# libMaliVulkan.so.1 on the loader path.
+apt-get --yes -qq install "/tmp/${LIBMALI_DEB}"
+rm -f "/tmp/${LIBMALI_DEB}"
+
+# Hold the GPU at its top OPP. The detector submits short bursts and then
+# blocks on a fence, so simple_ondemand reads the GPU as mostly idle and
+# keeps it near the 300 MHz floor; pinning it is worth ~20% and removes most
+# of the frame-time variance (worst-case 30.5 ms -> 12.0 ms).
+cat > /etc/udev/rules.d/99-mali-performance.rules <<'EOF'
+SUBSYSTEM=="devfreq", KERNEL=="fb000000.gpu", ATTR{governor}="performance"
+EOF
 
 # networkd isn't being used, this causes an unnecessary delay
 # systemctl disable systemd-networkd-wait-online.service
